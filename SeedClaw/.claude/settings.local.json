@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(code:*)",
+      "Bash(dpkg -l:*)",
+      "Bash(~/.platformio/penv/bin/pio run:*)"
+    ]
+  }
+}
