@@ -12,6 +12,14 @@
 
 static const char *TAG = "tools";
 
+// null終端を保証する安全な文字列コピー
+static void safe_strncpy(char *dest, const char *src, size_t dest_size)
+{
+    if (dest_size == 0) return;
+    strncpy(dest, src, dest_size - 1);
+    dest[dest_size - 1] = '\0';
+}
+
 // ツール定義JSON
 static const char *TOOLS_JSON =
 "["
@@ -140,8 +148,8 @@ static const char *TOOLS_JSON =
 typedef struct {
     char role[16];         // "user", "assistant"
     char content[1024];    // メッセージ内容 or JSON
-    char tool_use_id[32];
-    char tool_name[20];
+    char tool_use_id[48];  // Anthropic tool_use ID（余裕を持たせる）
+    char tool_name[24];    // ツール名（set_auto_interval=17）
     bool is_tool_use;
     bool is_tool_result;
 } history_entry_t;
@@ -221,32 +229,86 @@ void tools_init(void)
     ESP_LOGI(TAG, "Tools initialized");
 }
 
-// 履歴先頭がtool_result/tool_useで始まっていたら除去（ペア整合性を保つ）
+// tool_use/tool_resultペアの整合性を検証し、孤立エントリを除去
+static void sanitize_history(void)
+{
+    // 1. 全tool_use IDを収集
+    // 2. 対応するIDがないtool_resultを除去
+    // 3. 対応するtool_resultがないtool_useも除去
+    // 4. 先頭がuserテキストになるまで除去
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+
+        for (int i = 0; i < s_history_count; i++) {
+            if (s_history[i].is_tool_result) {
+                // このtool_resultに対応するtool_useがあるか？
+                bool found = false;
+                for (int j = 0; j < i; j++) {
+                    if (s_history[j].is_tool_use &&
+                        strcmp(s_history[j].tool_use_id, s_history[i].tool_use_id) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    memmove(&s_history[i], &s_history[i + 1],
+                            sizeof(history_entry_t) * (s_history_count - i - 1));
+                    s_history_count--;
+                    changed = true;
+                    break;
+                }
+            } else if (s_history[i].is_tool_use) {
+                // このtool_useに対応するtool_resultがあるか？
+                bool found = false;
+                for (int j = i + 1; j < s_history_count; j++) {
+                    if (s_history[j].is_tool_result &&
+                        strcmp(s_history[j].tool_use_id, s_history[i].tool_use_id) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    memmove(&s_history[i], &s_history[i + 1],
+                            sizeof(history_entry_t) * (s_history_count - i - 1));
+                    s_history_count--;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 先頭がuserテキストになるまで除去
+    while (s_history_count > 0 &&
+           (s_history[0].is_tool_result || s_history[0].is_tool_use ||
+            strcmp(s_history[0].role, "user") != 0)) {
+        memmove(&s_history[0], &s_history[1],
+                sizeof(history_entry_t) * (s_history_count - 1));
+        s_history_count--;
+    }
+}
+
 static void trim_history_safe(int need_slots)
 {
     int max_entries = SEEDCLAW_MAX_HISTORY * 2 + 6;
     while (s_history_count + need_slots > max_entries && s_history_count > 0) {
-        // 2エントリずつ削除
         int trim = (s_history_count >= 2) ? 2 : 1;
-        memmove(&s_history[0], &s_history[trim], sizeof(history_entry_t) * (s_history_count - trim));
+        memmove(&s_history[0], &s_history[trim],
+                sizeof(history_entry_t) * (s_history_count - trim));
         s_history_count -= trim;
     }
-    // 先頭がtool_result or tool_useなら孤立エントリを除去
-    while (s_history_count > 0 &&
-           (s_history[0].is_tool_result || s_history[0].is_tool_use)) {
-        memmove(&s_history[0], &s_history[1], sizeof(history_entry_t) * (s_history_count - 1));
-        s_history_count--;
-    }
+    sanitize_history();
 }
 
 static void add_user_message(const char *content)
 {
     trim_history_safe(1);
 
+    memset(&s_history[s_history_count], 0, sizeof(history_entry_t));
     strcpy(s_history[s_history_count].role, "user");
-    strncpy(s_history[s_history_count].content, content, sizeof(s_history[s_history_count].content) - 1);
-    s_history[s_history_count].is_tool_use = false;
-    s_history[s_history_count].is_tool_result = false;
+    safe_strncpy(s_history[s_history_count].content, content, sizeof(s_history[0].content));
     s_history_count++;
 }
 
@@ -254,10 +316,9 @@ static void add_assistant_text(const char *text)
 {
     trim_history_safe(1);
 
+    memset(&s_history[s_history_count], 0, sizeof(history_entry_t));
     strcpy(s_history[s_history_count].role, "assistant");
-    strncpy(s_history[s_history_count].content, text, sizeof(s_history[s_history_count].content) - 1);
-    s_history[s_history_count].is_tool_use = false;
-    s_history[s_history_count].is_tool_result = false;
+    safe_strncpy(s_history[s_history_count].content, text, sizeof(s_history[0].content));
     s_history_count++;
 }
 
@@ -661,15 +722,15 @@ char *react_loop(const char *user_message)
                 ids[valid_count] = strdup(id_j->valuestring);
 
                 // assistant tool_useエントリ
+                memset(&s_history[s_history_count], 0, sizeof(history_entry_t));
                 strcpy(s_history[s_history_count].role, "assistant");
-                strncpy(s_history[s_history_count].tool_use_id, id_j->valuestring,
-                        sizeof(s_history[0].tool_use_id) - 1);
-                strncpy(s_history[s_history_count].tool_name, name_j->valuestring,
-                        sizeof(s_history[0].tool_name) - 1);
-                strncpy(s_history[s_history_count].content, input_str,
-                        sizeof(s_history[0].content) - 1);
+                safe_strncpy(s_history[s_history_count].tool_use_id, id_j->valuestring,
+                             sizeof(s_history[0].tool_use_id));
+                safe_strncpy(s_history[s_history_count].tool_name, name_j->valuestring,
+                             sizeof(s_history[0].tool_name));
+                safe_strncpy(s_history[s_history_count].content, input_str,
+                             sizeof(s_history[0].content));
                 s_history[s_history_count].is_tool_use = true;
-                s_history[s_history_count].is_tool_result = false;
                 s_history_count++;
 
                 free(input_str);
@@ -678,12 +739,12 @@ char *react_loop(const char *user_message)
 
             // Phase 2: user tool_resultエントリ追加
             for (int tc = 0; tc < valid_count; tc++) {
+                memset(&s_history[s_history_count], 0, sizeof(history_entry_t));
                 strcpy(s_history[s_history_count].role, "user");
-                strncpy(s_history[s_history_count].tool_use_id, ids[tc],
-                        sizeof(s_history[0].tool_use_id) - 1);
-                strncpy(s_history[s_history_count].content, results[tc],
-                        sizeof(s_history[0].content) - 1);
-                s_history[s_history_count].is_tool_use = false;
+                safe_strncpy(s_history[s_history_count].tool_use_id, ids[tc],
+                             sizeof(s_history[0].tool_use_id));
+                safe_strncpy(s_history[s_history_count].content, results[tc],
+                             sizeof(s_history[0].content));
                 s_history[s_history_count].is_tool_result = true;
                 s_history_count++;
 
@@ -692,7 +753,6 @@ char *react_loop(const char *user_message)
             }
 
             cJSON_Delete(tool_calls);
-            i += (valid_count - 1); // 複数ツール分のカウント調整
         }
     }
 
@@ -711,8 +771,10 @@ char *autonomous_check(void)
     // ルールからプロンプトを構築
     char prompt[1536];
     int offset = snprintf(prompt, sizeof(prompt),
-        "自律監視モード。以下のルールに従いツールでセンサーを確認し、"
-        "アクション実行や異常検知時のみ簡潔に報告。変化なければ「変化なし」とだけ答えて。\n\n"
+        "【自律監視の実行】今すぐ以下のルールに従い行動せよ。\n"
+        "使用可能: gpio_read, gpio_write, adc_read, pwm_set, gpio_status, web_fetch\n"
+        "禁止: rule_add, rule_remove, rule_clear, set_auto_interval, get_rules（設定済み。再設定不要）\n"
+        "実行結果を1行で報告。変化なければ「変化なし」。\n\n"
         "ルール:\n");
 
     for (int i = 0; i < s_rules_count && offset < (int)sizeof(prompt) - 260; i++) {
@@ -733,8 +795,11 @@ char *autonomous_check(void)
         return NULL;
     }
 
-    // 「変化なし」なら報告不要
-    if (strstr(result, "変化なし") != NULL) {
+    // 報告不要な応答をフィルタ
+    if (strstr(result, "変化なし") != NULL ||
+        strstr(result, "こんにちは") != NULL ||
+        strstr(result, "お手伝い") != NULL ||
+        strstr(result, "エラー") != NULL) {
         free(result);
         return NULL;
     }

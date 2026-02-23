@@ -113,6 +113,15 @@ int gpio_ctrl_read(int pin)
         return -1;
     }
 
+    // OUTPUT/PWMモードの場合は状態を壊さずそのまま読む
+    if (s_pin_state[pin].mode == PIN_MODE_OUTPUT || s_pin_state[pin].mode == PIN_MODE_PWM) {
+        int level = gpio_get_level(pin);
+        s_pin_state[pin].value = level;
+        ESP_LOGI(TAG, "GPIO%d read (output mode): %d", pin, level);
+        return level;
+    }
+
+    // 未使用またはINPUT以外→INPUTに設定
     if (s_pin_state[pin].mode != PIN_MODE_INPUT) {
         gpio_reset_pin(pin);
         gpio_set_direction(pin, GPIO_MODE_INPUT);
@@ -142,8 +151,11 @@ esp_err_t gpio_ctrl_write(int pin, int value)
         ledc_stop(LEDC_LOW_SPEED_MODE, s_pin_state[pin].pwm_channel, 0);
     }
 
-    gpio_reset_pin(pin);
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    // OUTPUT以外からの切り替え時のみリセット
+    if (s_pin_state[pin].mode != PIN_MODE_OUTPUT) {
+        gpio_reset_pin(pin);
+        gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT);  // 入出力両方有効（読み戻し可能）
+    }
     gpio_set_level(pin, value);
 
     s_pin_state[pin].mode = PIN_MODE_OUTPUT;
