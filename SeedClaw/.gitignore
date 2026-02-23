@@ -19,7 +19,7 @@ dependencies.lock
 *.log
 
 # Secret credentials (NEVER commit!)
-src/secrets.h
+
 
 # PlatformIO
 .pio/
